@@ -25,7 +25,7 @@ class LineFinder(object):
         if not other_dims:
             # This is presumed to be the Stokes axis. If it doesn't exist, create.
             self.data = self.data[None,...]
-            other_dims = 1
+            other_dims = (1,)
         if len(other_dims) > 1:
             raise ValueError('Unexpected cube shape. Should have 3 or 4 axes')
         self.n_stokes = other_dims[0]
@@ -109,17 +109,26 @@ class LineFinder(object):
         all_chans = np.arange(len(self.snr[stokes_index]))
         self.non_peaks[stokes_index] = all_chans[self.non_peak_mask[stokes_index]]
 
-    def plot(self, inverse=False, stokes_index=0):
+    def plot(self, inverse=False, residuals=False, stokes_index=0):
         """Plot the line channels (or continuum if inverse=True)."""
         if self.peaks[stokes_index] is None:
             raise RuntimeError('find_lines has not been called for this stokes')
 
-        plt.plot(self.snr[stokes_index])
+        if residuals:
+            residuals = self.snr[stokes_index].copy()
+            # Use NaNs to create discontinuties in the line plot
+            residuals[self.peaks[stokes_index]] = np.nan
+            plt.plot(residuals)
+        else:
+            plt.plot(self.snr[stokes_index])
+        # The -1 is a fudge to get the identified channels below SNR data:
         offset = self.snr[stokes_index][self.non_peak_mask[stokes_index]].mean() - 1
         if inverse:
+            # Mark continuum channels
             y_offset = np.zeros_like(self.non_peaks[stokes_index]) + offset
             plt.plot(self.non_peaks[stokes_index], y_offset, '.')
         else:
+            # Mark lines channels
             y_offset = np.zeros_like(self.peaks[stokes_index]) + offset
             plt.plot(self.peaks[stokes_index], y_offset, '.')
         plt.show()
@@ -130,9 +139,9 @@ class LineFinder(object):
         if self.peaks[stokes_index] is None:
             raise RuntimeError('find_lines has not been called for this stokes')
         if not inverse:
-            print(self.aggrigate(self.peaks[stokes_index]))
+            return self.aggrigate(self.peaks[stokes_index])
         else:
-            print(self.aggrigate(self.non_peaks[stokes_index]))
+            return self.aggrigate(self.non_peaks[stokes_index])
 
     @staticmethod
     def aggrigate(vals):
@@ -176,6 +185,8 @@ def main():
                         help='Do continuum instead of lines.')
     parser.add_argument('--annulus', action='store_true',
                         help='Plot the annulus used to determine noise.')
+    parser.add_argument('--residual', action='store_true',
+                        help='Plot the SNR of the continuum channels only.')
     parser.add_argument('fitsfile', type=str)
     args = parser.parse_args()
 
@@ -183,8 +194,8 @@ def main():
     line_finder.find_lines(args.sigma, args.pad)
     if args.annulus:
         line_finder.plot_annulus()
-    line_finder.plot(args.invert)
-    line_finder.spw_string(args.invert)
+    line_finder.plot(inverse=args.invert, residuals=args.residual)
+    print(line_finder.spw_string(args.invert))
 
 
 if __name__ == '__main__':
