@@ -4,6 +4,7 @@
 
 from __future__ import print_function, division
 import argparse
+import math
 from astropy.io import fits
 import numpy as np
 import matplotlib.pyplot as plt
@@ -12,6 +13,86 @@ DEFAULT_RADIUS = 0.8
 DEFAULT_WIDTH = 0.1
 DEFAULT_SIGMA = 5.75
 DEFAULT_BOXCAR_WIDTH = 30
+
+class FitsFreqs(object):
+    """Class to work with frequencies in a FITS file.
+    Specifically, converting to 'pretty' strings."""
+
+    SI_PREFIX_INC = 3
+    SI_PREFIXES = ['', 'k', 'M', 'G', 'T', 'P']
+
+    def __init__(self, filename):
+        header = fits.getheader(filename)
+        freq_axis = self._get_freq_axis(header)
+        n_freq = header['NAXIS{}'.format(freq_axis)]
+        self.unit = header['CUNIT{}'.format(freq_axis)]
+        self.ref = float(header['CRVAL{}'.format(freq_axis)])
+        self.delta = float(header['CDELT{}'.format(freq_axis)])
+        self.ref_channel = float(header['CRPIX{}'.format(freq_axis)])
+        channel_offsets = np.arange(-self.ref_channel + 1,
+                                    n_freq + self.ref_channel - 1)
+        self.freqs = channel_offsets * self.delta + self.ref
+        self._mag = None
+        self._fstrings = None
+
+    @staticmethod
+    def _get_freq_axis(header):
+        """Return frequency axis index"""
+        for i in range(1, header['NAXIS'] + 1):
+            if header['CTYPE{}'.format(i)] == 'FREQ':
+                return i
+        raise ValueError('FREQ axis not found in header')
+
+    @property
+    def assending(self):
+        """Return if frequencies are accending or not"""
+        return self.delta > 0
+
+    def _delta_magnitude(self):
+        """Return the order of the channel increment"""
+        return int(math.log(self.delta, 10))
+
+    def _ref_magnitude(self):
+        """Return the order of the channel increment"""
+        mag = math.log(self.ref, 10)
+        # Get the magnitude in orders of 10**3 (Hz, kHz, MHz,...)
+        mag = mag // self.SI_PREFIX_INC * self.SI_PREFIX_INC
+        return min(mag, self.SI_PREFIX_INC * len(self.SI_PREFIXES)) # Only go up to 'Peta'
+
+    @property
+    def magnitude(self):
+        """Returns the magnitude of the reference frequency"""
+        if self._mag is None:
+            self._mag = self._ref_magnitude()
+        return self._mag
+
+    @property
+    def magnitude_unit(self):
+        """Returns the magnitude of the reference frequency"""
+        return self.SI_PREFIXES[int(self.magnitude / self.SI_PREFIX_INC)] + 'Hz'
+
+    @property
+    def strings(self):
+        """Returns an numpy array of strings of freqs"""
+        if self._fstrings is None:
+            self._fstrings = self._to_string(self.freqs)
+        return self._fstrings
+
+    def __str__(self):
+        """String representation"""
+        return str(self.strings)
+
+    def _to_string(self, freqs, space=False):
+        """Returns a string representation of the supplied freqs"""
+        precision = int(self.magnitude - self._delta_magnitude())
+        if space:
+            space_char = ' '
+        else:
+            space_char = ''
+        fmt_str = '{{:.0{}f}}{}{{}}'.format(precision, space_char)
+        freq_strs = [fmt_str.format(f / 10**self.magnitude, self.magnitude_unit) for f in freqs]
+        return np.array(freq_strs)
+
 
 class LineFinder(object):
     """Class to identify lines / continuum in cubes."""
@@ -29,6 +110,7 @@ class LineFinder(object):
         if len(other_dims) > 1:
             raise ValueError('Unexpected cube shape. Should have 3 or 4 axes')
         self.n_stokes = other_dims[0]
+        self.freqs = FitsFreqs(cube)
         self.radius = radius
         self.width = width
         self.rms = None
@@ -94,6 +176,7 @@ class LineFinder(object):
     def find_lines(self, sigma=DEFAULT_SIGMA, pad=DEFAULT_BOXCAR_WIDTH, stokes_index=0):
         """Re-calculate the continuum and line channels.
         Use 'plot()' or 'spw_string()' to get results."""
+        assert pad > 0
         if self.rms is None:
             self.noise()
         if self.maxx is None:
@@ -109,58 +192,79 @@ class LineFinder(object):
         all_chans = np.arange(len(self.snr[stokes_index]))
         self.non_peaks[stokes_index] = all_chans[self.non_peak_mask[stokes_index]]
 
-    def plot(self, inverse=False, residuals=False, stokes_index=0):
+    def plot(self, inverse=False, residuals=False, savefig='', stokes_index=0):
         """Plot the line channels (or continuum if inverse=True)."""
         if self.peaks[stokes_index] is None:
             raise RuntimeError('find_lines has not been called for this stokes')
 
+        f_vals = self.freqs.freqs / 10**self.freqs.magnitude
+        f_unit = self.freqs.magnitude_unit
+
+        plt.xlabel(f_unit)
+        plt.ylabel('S/N')
         if residuals:
             residuals = self.snr[stokes_index].copy()
             # Use NaNs to create discontinuties in the line plot
             residuals[self.peaks[stokes_index]] = np.nan
-            plt.plot(residuals)
+            plt.plot(f_vals, residuals)
         else:
-            plt.plot(self.snr[stokes_index])
+            plt.plot(f_vals, self.snr[stokes_index])
         # The -1 is a fudge to get the identified channels below SNR data:
         offset = self.snr[stokes_index][self.non_peak_mask[stokes_index]].mean() - 1
         if inverse:
             # Mark continuum channels
             y_offset = np.zeros_like(self.non_peaks[stokes_index]) + offset
-            plt.plot(self.non_peaks[stokes_index], y_offset, '.')
+            plt.plot(f_vals[self.non_peaks[stokes_index]], y_offset, '.')
         else:
             # Mark lines channels
             y_offset = np.zeros_like(self.peaks[stokes_index]) + offset
-            plt.plot(self.peaks[stokes_index], y_offset, '.')
-        plt.show()
+            plt.plot(f_vals[self.peaks[stokes_index]], y_offset, '.')
+        if savefig:
+            plt.savefig(savefig)
+            plt.clf()
+        else:
+            plt.show()
 
     def spw_string(self, inverse=False, stokes_index=0):
         """Return a CASA SPW format string of the continuum channels
         (or lines if inverse=True)."""
         if self.peaks[stokes_index] is None:
             raise RuntimeError('find_lines has not been called for this stokes')
-        if not inverse:
-            return self.aggrigate(self.peaks[stokes_index])
-        else:
-            return self.aggrigate(self.non_peaks[stokes_index])
+        if inverse:
+            return self._aggrigate(self.non_peaks[stokes_index])
+        return self._aggrigate(self.peaks[stokes_index])
+
+    def _aggrigate(self, vals, chans=False):
+        """Generate a CASA spw string from a numpy array."""
+        range_list = self._aggrigate_consecutive(vals)
+        out_str = ''
+        for irange in range_list:
+            if not chans:
+                irange = [self.freqs.strings[i] for i in irange]
+            if len(irange) == 1:
+                out_str += '{};'.format(irange[0])
+            else:
+                out_str += '{}~{};'.format(irange[0], irange[1])
+        return out_str
 
     @staticmethod
-    def aggrigate(vals):
+    def _aggrigate_consecutive(vals):
         """Generate a CASA spw string from a numpy array."""
-        out_str = ''
+        out_list = []
         start = vals[0]
         i = 0 # initialise in case len(vals) == 1
         for i in range(1, len(vals)):
             if vals[i] != vals[i-1] + 1:
                 if start == vals[i-1]:
-                    out_str += '{};'.format(start)
+                    out_list.append((start,))
                 else:
-                    out_str += '{}~{};'.format(start, vals[i-1])
+                    out_list.append((start, vals[i-1]))
                 start = vals[i]
         if start == vals[i]:
-            out_str += '{};'.format(start)
+            out_list.append((start,))
         else:
-            out_str += '{}~{};'.format(start, vals[i])
-        return out_str
+            out_list.append((start, vals[i]))
+        return out_list
 
 
 def main():
